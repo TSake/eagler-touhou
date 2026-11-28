@@ -654,6 +654,9 @@ export function createBrowserSession({document, window, baseUrl: configuredBaseU
         if (element.isConnected && parent) {element.remove(); parent.insertBefore(element, next);}
       },
       onEvent: (message, context) => {const ownsPresentation = !context.fileOnly || fileRuntimePresentation?.() !== false; if (ownsPresentation) transfer.runtimeEvent(message); if (ownsPresentation && message.event === 'ready') {nativeFailure=null;gameData.finish();}
+      // A running game owns the audio presentation. Pause launcher-side room music so
+      // it does not overlap the in-game BGM (the WASM side already stops its own menu BGM).
+      if (ownsPresentation && message.event === 'first-frame') roomSession?.music?.pause();
       if (ownsPresentation && message.event === 'first-frame' && runtime?.getSnapshot().firstFrame) {reportGameLoaded(); transfer.launchAcknowledged();}
       if (message.event === 'network-request') titleNetwork.open();
       if (message.event === 'runtime-info' && message.netplayTiming) {calibration.record(message.netplayTiming, runtime!.getSnapshot().epoch ?? 0); roomSession?.service.acceptMeasuredTiming(message.netplayTiming);}

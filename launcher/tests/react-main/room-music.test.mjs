@@ -234,6 +234,20 @@ test('leave clears a resolver deadline immediately and media failure stops synch
   expect(f.audio.src).toBe('');expect(vi.getTimerCount()).toBe(0);f.model.dispose();
 });
 
+test('pause() stops room music via the same control path without resuming when already paused',async()=>{
+  vi.useFakeTimers();const stream=vi.fn(async()=>['https://music.example/a.mp3']),f=fixture(stream);
+  f.model.receive(session);await settle();
+  // A shared session pauses for everyone through a single 'pause' command.
+  f.model.pause();
+  expect(f.sent.at(-1)).toMatchObject({action:'pause',session:session.session,revision:2});
+  f.model.receive({...session,revision:3,pausedAt:6500,serverTime:8000});await settle();
+  expect(f.audio.paused).toBe(true);
+  // Idempotent: pausing again while already paused never flips into resume.
+  f.model.pause();
+  expect(f.sent.at(-1)).toMatchObject({action:'pause',revision:3});
+  expect(f.sent.some(m=>m.action==='resume')).toBe(false);
+  f.model.dispose();
+});
 test('shared pause freezes time and resume reuses the loaded source',async()=>{
   vi.useFakeTimers();const stream=vi.fn(async()=>['https://music.example/a.mp3']),f=fixture(stream);
   f.model.receive(session);await settle();f.model.togglePlayback();

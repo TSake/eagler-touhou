@@ -246,17 +246,160 @@ function netplayRoomFromUrl(url) {
 }
 
 /**
- * netplay URL → 信令 WebSocket 地址。
- * 房间流程下发的 URL 可能带 launcher 自己的查询参数（run/runtimeGeneration），
- * BRO 信令只认 ws(s)://host:port，所以只保留协议+主机+端口。
+ * netplay URL → eagler relay 信令 WebSocket 地址。
+ *
+ * 以前这里只返回 ws(s)://host:port（剥掉所有 query），那是 BRO 自有信令服
+ * （web/tools/signaling.mjs）的语义。正式房间走的是 eagler netplay relay
+ * （services/relay/src/netplay-relay.mjs），它的 signal=1 通道**完全靠 URL query**
+ * 决定连接归属：room/run/member/player/players 缺一就会 close(1008)。
+ * 所以这里必须保留 launcher 下发的 query，并补上 signal=1 与 players。
  */
-function netplaySignalUrl(url) {
+export function netplaySignalUrl(url, playerCount) {
   if (typeof url !== 'string' || !url) return '';
   if (!/^wss?:\/\//i.test(url)) return '';
   try {
     const u = new URL(url);
-    return `${u.protocol}//${u.host}`;
+    // eagler relay 的 signal=1 通道完全靠 URL query 判定连接归属。只有
+    // launcher 的 gameplay relay URL（带 room/run/member）才需要补 signal=1；
+    // BRO 自有信令服（web/tools/signaling.mjs，?room=session_x）不能加，
+    // 否则 _createMulti 的 isRelay 判定会把直连流程误判成 relay。
+    const isEaglerRelay = u.searchParams.has('run') || u.searchParams.has('member');
+    if (isEaglerRelay) {
+      u.searchParams.set('signal', '1');
+      if (Number.isInteger(playerCount) && playerCount >= 2 && !u.searchParams.has('players')) {
+        u.searchParams.set('players', String(playerCount));
+      }
+    }
+    return u.toString();
   } catch { return ''; }
+}
+
+/**
+ * eagler netplay relay 信令门面（BRO kind 协议 ↔ relay type 协议双向翻译）。
+ *
+ * BRO netcode/multiplayer 说的是自有信令协议：
+ *   {kind:'description'|'ice'|'renegotiate', room, from, to, description|candidate}
+ * eagler relay 的 signal=1 通道只认：
+ *   {type:'signal', to, description|candidate} / {type:'rtc-ready'} / {type:'peers',...}
+ * 连接归属由 URL query 决定（不再是 kind:'join' 握手）。
+ *
+ * 本门面实现 NetPeer 需要的 signal 接口：send/onMessage/onOpen/onClose/close +
+ * ws/url/ready getter。入站把 relay signal 注入 room/to 后交给 netcode 的
+ * onMessage 监听器（否则 netcode.mjs:445 的 room 校验会把消息丢弃）；
+ * peers/peer-join/route/error 原样回给 adapter 的 _onSignalMessage。
+ * DC open 后由 adapter 调 notifyRtcReady() 回报 relay（route=rtc 的开赛栅栏）。
+ */
+export function createRelaySignalFacade({ url, room, player, WebSocketCtor, onMessage }) {
+  const Ws = WebSocketCtor || (typeof WebSocket !== 'undefined' ? WebSocket : null);
+  if (!Ws) throw new Error('createRelaySignalFacade: WebSocket unavailable');
+  const msgListeners = [], closeListeners = [], openListeners = [];
+  let ws = null, retryTimer = null, manualClose = false, settled = false, rtcReadySent = false;
+  // relay 可能先于 netcode 绑定 onMessage 就转发 SDP/ICE（这里由 peers/peer-join
+  // 触发 startNet，时序与 relay 的广播不完全确定）。缓存 signal 消息直到 NetPeer
+  // 注册 onMessage，再按序放行，避免 offer 在绑定前被丢。
+  let pendingSignals = [];
+
+  function deliver(m) {
+    if (typeof onMessage === 'function') onMessage(m);
+    for (const cb of msgListeners) cb(m);
+  }
+
+  function deliverSignal(m) {
+    if (!msgListeners.length) { pendingSignals.push(m); return; }
+    deliver(m);
+  }
+
+  function scheduleRetry() {
+    if (manualClose || retryTimer) return;
+    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, 1000);
+  }
+
+  function connect() {
+    settled = false;
+    try { ws = new Ws(url); } catch (_) { scheduleRetry(); return; }
+    const current = ws;
+    current.addEventListener('open', () => {
+      if (settled) return;
+      settled = true;
+      openListeners.forEach((cb) => cb({ url }));
+    });
+    current.addEventListener('message', (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      if (!m || typeof m !== 'object') { deliver(m); return; }
+      if (m.type === 'signal') {
+        const from = Number(m.from);
+        if (m.description) deliverSignal({ kind: 'description', room, from, to: player, description: m.description });
+        else if (m.candidate) deliverSignal({ kind: 'ice', room, from, to: player, candidate: m.candidate });
+        return;
+      }
+      // peers / peer-join / route / error 等控制面消息交给 adapter 处理。
+      deliver(m);
+    });
+    current.addEventListener('close', () => {
+      closeListeners.forEach((cb) => cb({ url, manual: manualClose }));
+      if (!manualClose) scheduleRetry();
+    });
+    current.addEventListener('error', () => {
+      if (settled) return;
+      settled = true;
+      try { current.close(); } catch (_) { /* noop */ }
+      scheduleRetry();
+    });
+  }
+
+  const facade = {
+    get ws() { return ws; },
+    get url() { return url; },
+    get ready() { return !!ws && ws.readyState === 1; },
+    send(msg) {
+      if (!ws || ws.readyState !== 1) return false;
+      if (!msg || typeof msg !== 'object') return false;
+      let out = null;
+      if (msg.kind === 'description' && msg.description) {
+        out = { type: 'signal', to: msg.to, description: msg.description };
+      } else if (msg.kind === 'ice' && msg.candidate) {
+        out = { type: 'signal', to: msg.to, candidate: msg.candidate };
+      } else if (msg.kind === 'join') {
+        // 连接归属已由 URL query 完成；relay 无 join 语义（且缺 type 会被 1008 拒绝）。
+        return true;
+      } else if (msg.kind === 'renegotiate' || msg.kind === 'renegotiate-direct') {
+        // relay 常规信令路径无 seat 绑定、也不过滤 SDP 的 offer/answer 角色，
+        // 不改变 initiator 的 renegotiate 无需转发；需要重建 PC 的一端自己会重发 offer。
+        return true;
+      } else if (msg.type === 'rtc-ready') {
+        out = { type: 'rtc-ready' };
+      }
+      if (!out) return true;              // 未知 BRO 消息：静默丢弃，不喂给 relay
+      ws.send(JSON.stringify(out));
+      return true;
+    },
+    notifyRtcReady() {
+      if (rtcReadySent || !ws || ws.readyState !== 1) return false;
+      rtcReadySent = true;
+      ws.send(JSON.stringify({ type: 'rtc-ready' }));
+      return true;
+    },
+    onMessage(cb) {
+      msgListeners.push(cb);
+      if (pendingSignals.length) {
+        const queued = pendingSignals;
+        pendingSignals = [];
+        for (const m of queued) deliver(m);
+      }
+      return this;
+    },
+    onOpen(cb) { openListeners.push(cb); return this; },
+    onClose(cb) { closeListeners.push(cb); return this; },
+    close() {
+      manualClose = true;
+      clearTimeout(retryTimer);
+      if (ws) { try { ws.close(); } catch (_) { /* noop */ } }
+      return true;
+    },
+  };
+  connect();
+  return facade;
 }
 
 /** Lua 字符串字面量（只用于自机类名/系统 csv，内容受限）。 */
@@ -933,6 +1076,12 @@ export class EaglerRuntimeAdapter {
         this.multi = this._createMulti(mod, np);
       }
       const multi = this.multi;
+      // eagler relay：DC open 后必须回报 rtc-ready，否则 route 选路超时会关掉
+      // 所有信令 socket（netplay-relay.mjs:1369-1394 / :1021-1025）。
+      if (this._relaySignal && typeof multi.on === 'function' && !this._rtcReadyWired) {
+        this._rtcReadyWired = true;
+        multi.on('open', () => { this._relaySignal.notifyRtcReady(); });
+      }
       // 1) 先把「我是哪个槽 / 房间几个人 / 每人用谁」下发到 Lua，
       //    远端真身生成时要用到 loadouts（BRO_net_autospawn_remotes）。
       this.applyNetplaySlots();
@@ -943,10 +1092,10 @@ export class EaglerRuntimeAdapter {
           this.netplayConnectError = String(error && error.message || error);
         }
       }
-      if (typeof multi.startNet === 'function') {
-        const net = multi.startNet();
-        if (net && typeof net.catch === 'function') void net.catch(() => {});
-      }
+      // 2b) 启动 WebRTC 协商。relay 模式下等对端入房（peers/peer-join）再由
+      //     _onSignalMessage 触发，否则 host 的 offer 会被 relay 因目标未注册而丢弃。
+      //     BRO 自有信令服（直连）没有 peers/peer-join 语义，仍需这里直接启动。
+      if (!this._relaySignal) this._requestNetStart();
       // 3) 发起 match：BRO_net_start_match 会设种子/关卡并 BRO_enter_stage。
       if (typeof multi.startMatch === 'function') multi.startMatch(undefined, np.seed ?? undefined);
       if (typeof multi.sendReady === 'function') multi.sendReady(true);
@@ -976,21 +1125,36 @@ export class EaglerRuntimeAdapter {
 
   /** 用真实门面建链（宿主注入工厂时优先工厂，便于测试/自定义传输）。 */
   _createMulti(mod, np) {
-    if (this.multiFactory) return this.multiFactory(this._multiOptions(np));
-    const opts = this._multiOptions(np);
+    const options = this._multiOptions(np);
+    if (this.multiFactory) return this.multiFactory(options);
+    const opts = options;
     const Ctor = mod && (mod.BROMultiplayer || mod.default);
     if (typeof Ctor !== 'function') throw new Error('BROMultiplayer class missing');
     let signal = null;
-    const url = np.signalUrl || netplaySignalUrl(np.url);
-    if (url && typeof mod.createWebSocketSignal === 'function') {
-      // 信令语义与 web/test/browser/lobby.html 相同：client 收到 joined、
-      // host 看到房间里第二个人时，才真正开始 WebRTC 协商。
-      signal = mod.createWebSocketSignal({
-        url,
-        room: opts.room,
-        player: opts.player,
-        onMessage: (m) => this._onSignalMessage(m),
-      });
+    const url = np.signalUrl || netplaySignalUrl(np.url, opts.maxPlayers);
+    if (url) {
+      let isRelay = false;
+      try { isRelay = new URL(url).searchParams.get('signal') === '1'; } catch { /* noop */ }
+      if (isRelay) {
+        // 正式房间：eagler netplay relay 的 signal=1 通道。BRO kind 协议与 relay
+        // type 协议不通用，用门面做双向翻译（连接归属由 URL query 完成）。
+        signal = createRelaySignalFacade({
+          url,
+          room: opts.room,
+          player: opts.player,
+          WebSocketCtor: this.WebSocketCtor,
+          onMessage: (m) => this._onSignalMessage(m),
+        });
+      } else if (typeof mod.createWebSocketSignal === 'function') {
+        // BRO 自有信令服（web/test/browser/lobby.html 直连流程）：client 收到
+        // joined、host 看到房间里第二个人时，才真正开始 WebRTC 协商。
+        signal = mod.createWebSocketSignal({
+          url,
+          room: opts.room,
+          player: opts.player,
+          onMessage: (m) => this._onSignalMessage(m),
+        });
+      }
     }
     const multi = new Ctor({
       ...opts,
@@ -998,6 +1162,7 @@ export class EaglerRuntimeAdapter {
       role: opts.player === 0 ? 'host' : 'client',
       delay: Number.isFinite(np.inputDelay) ? np.inputDelay : undefined,
     });
+    this._relaySignal = signal && typeof signal.notifyRtcReady === 'function' ? signal : null;
     return multi;
   }
 
@@ -1005,10 +1170,34 @@ export class EaglerRuntimeAdapter {
     const multi = this.multi;
     if (!multi || !message || typeof multi.startNet !== 'function') return;
     const kind = message.kind;
-    if (kind === 'joined' && Number(multi.player) !== 0) void multi.startNet().catch(() => {});
+    // BRO 自有信令服语义（保留直连流程）。
+    if (kind === 'joined' && Number(multi.player) !== 0) return this._requestNetStart();
     if (kind === 'peer' && Number(message.count) >= 2 && Number(multi.player) === 0) {
-      void multi.startNet().catch(() => {});
+      return this._requestNetStart();
     }
+    // eagler relay 语义：relay 从不发 kind:'joined'/'peer'，而是 peers / peer-join。
+    // relay 只把 signal 转发给已注册的 signalClients，所以必须等对端入房
+    // （peers 非空 / peer-join）再 startNet，否则 host 的 offer 会因目标不存在被丢弃。
+    const type = message.type;
+    if (type === 'peers' && Array.isArray(message.peers) && message.peers.length > 0) {
+      return this._requestNetStart();
+    }
+    if (type === 'peer-join' && Number(message.player) !== Number(multi.player)) {
+      return this._requestNetStart();
+    }
+    if (type === 'route') {
+      this.netplayRoute = message.mode === 'rtc' ? 'rtc' : (message.mode || null);
+      if (message.mode === 'failed') {
+        this.netplayWiring = { ...(this.netplayWiring || {}), routeFailed: true, reason: message.reason || 'route-failed' };
+      }
+    }
+  }
+
+  /** startNet 非幂等（会重开 PC），信令可能多次触发，这里统一去重。 */
+  _requestNetStart() {
+    if (this._netStartRequested || !this.multi) return;
+    this._netStartRequested = true;
+    void this.multi.startNet().catch(() => {});
   }
 
   /** 把房间人数 / 本地槽 / 各槽自机下发给 Lua（远端真身生成依赖它）。 */
@@ -1116,7 +1305,7 @@ export class EaglerRuntimeAdapter {
     // 阶段 3AZ：房间号/信令地址解析（netplay URL 形如 ws://host:port?room=xxx）。
     this.netplay.room = (typeof o.netplayRoom === 'string' && o.netplayRoom)
       || netplayRoomFromUrl(this.netplay.url) || 'bro-default';
-    this.netplay.signalUrl = netplaySignalUrl(this.netplay.url);
+    this.netplay.signalUrl = netplaySignalUrl(this.netplay.url, this.netplay.playerCount);
     // 若宿主提供工厂，按 eagler netplay 参数构造门面（对齐 URL/player/人数）。
     if (this.multiFactory && typeof this.ccall === 'function') {
       this.multi = this.multiFactory(this._multiOptions(this.netplay));

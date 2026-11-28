@@ -651,6 +651,14 @@ export function createRoomMusic({
       if (!state || !snapshot.inRoom || snapshot.status === 'loading') return;
       control(state.pausedAt == null && !state.ended && snapshot.status !== 'ended' ? 'pause' : 'resume');
     },
+    // Pause room music when a game takes over the presentation (e.g. on first frame).
+    // Uses the same control path as the UI pause button, so shared sessions pause for
+    // everyone and personal playback pauses locally. Idempotent when already paused.
+    pause() {
+      const state = snapshot.session;
+      if (!state || !snapshot.inRoom || snapshot.status === 'loading') return;
+      control('pause');
+    },
     seek(seconds: number) {
       if (disposed || !snapshot.inRoom || (snapshot.joined && !snapshot.seated) ||
         !snapshot.duration || !Number.isFinite(seconds)) return false;
